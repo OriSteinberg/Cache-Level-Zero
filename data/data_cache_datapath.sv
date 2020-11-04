@@ -11,9 +11,9 @@ module data_cache_datapath
     // control                                            
     input  logic                                search_i,      
     output logic                                miss_o,
-    output logic [LOG2_NUM_BLKS-1:0]            data_line_o,                              
+    output logic [LOG2_NUM_BLKS-1:0]            data_line_o,       // for LRU use                        
     input  logic                                write_to_mem_i,    // set if there are more dirty lines than MAX_DIRTY                           
-    input  logic [LOG2_NUM_BLKS - 1:0]          rplc_line_idx_i,
+    input  logic [LOG2_NUM_BLKS - 1:0]          rplc_line_idx_i,   // which line to replace
     output logic [LOG2_NUM_BLKS:0]              dirty_num_o,
     // core
     output logic [DATA_CORE_WIDTH-1:0]          data_o,
@@ -61,7 +61,7 @@ module data_cache_datapath
     logic [LOG2_NUM_BLKS - 1:0]               line_ix_hit;
     logic [LOG2_NUM_BLKS - 1:0]               line_ix_miss_d;
     logic [LOG2_NUM_BLKS - 1:0]               line_ix_miss;
-    logic [LOG2_NUM_BLKS - 1:0]               rplc_dirty_ind;
+    logic [LOG2_NUM_BLKS - 1:0]               rplc_dirty_idx;
     logic                                     miss_ix_dirty;
     logic [LOG2_NUM_BLKS:0]                   dirty_num_d;
     logic                                     we_d;
@@ -76,7 +76,7 @@ module data_cache_datapath
     logic [31:0]                              be_32_miss, be_32_hit;
     
                         //---------------------------------- logic -----------------------------------------//
-	assign {tag, offset} = addr_i[31:2]; 	
+	assign {tag, offset} = addr_i[31:2]; 	// (tag-28, offset-2)
     assign data_o = (data_rvalid_i == 0)? cache_arr[data_line_o][offset_d]:             // data in the cache
                                           mem_data_i[(offset_miss_d+1) * 32 -1 -: 32];  // data from RAM
     
@@ -87,6 +87,7 @@ module data_cache_datapath
         for(i = 0; i < NUM_BLKS; i = i+1) begin: gen_comp
             wire [LOG2_NUM_BLKS:0] dirty_line;
             assign match[i] = ~|(tag^cache_tag[i]);  // if there is match in line i so the i-th bit of 'match' is set 
+            // sum dirty lines
             if(i == 0)
                 assign dirty_line = |cache_dirty[i];
             else 
@@ -113,7 +114,7 @@ module data_cache_datapath
         cache_dirty_d    = cache_dirty;
         cache_arr_d      = cache_arr;
         cache_tag_d      = cache_tag;  
-        rplc_dirty_ind   = 'b0;
+        rplc_dirty_idx   = 'b0;
         write_data_o     = 'b0;
         waddr_o          = 32'b0;
         match_indx       = 'b0;
@@ -125,26 +126,29 @@ module data_cache_datapath
         be_32_hit        = 'b0;
         be_32_miss       = 'b0;
         
+        // get the first match indx
         for(j = 0; j < NUM_BLKS; j = j+1) 
             if (match[j]==1 && !match_indx) 
                 match_indx = j;
                 
+        // search dirty line to write to memory
+        // line that is dirty and we are not writing to her
         for(k = 0; k < NUM_BLKS; k = k+1) begin
-            rplc_dirty_ind = (rplc_line_idx_i + k) % NUM_BLKS;
-            // if the line is dirty and we are not writing to her
-            if(cache_dirty[rplc_dirty_ind] != 0 && ~((write_cache_hit && rplc_dirty_ind == line_ix_hit) || (write_cache_miss && (rplc_dirty_ind == line_ix_miss_d)))) begin
+            rplc_dirty_idx = (rplc_line_idx_i + k) % NUM_BLKS;        
+            //                line is dirty                        write to hit line                                      write to miss line
+            if(cache_dirty[rplc_dirty_idx] != 0 && ~((write_cache_hit && rplc_dirty_idx == line_ix_hit) || (write_cache_miss && (rplc_dirty_idx == line_ix_miss_d)))) begin
                 break;
             end
         end
         
         if(search_i) begin     
-            if(data_rvalid_i) begin 
+            if(data_rvalid_i) begin                        // data arrive from memory
                 if(tag == tag_d) begin                     // the requested data is the data just arrive from RAM  
                     line_ix_hit = line_ix_miss_d;
                     hit         = 1'b1;
                 end else if(match_indx == line_ix_miss_d)  // the requested data is in the line we going to replace
                     hit = 1'b0;     
-                else begin                                 // check if the data at other line in the cache
+                else begin                                 // check if the data at the rest of cache lines
                     line_ix_hit = match_indx;            
                     hit         = |match && cache_vld_d[match_indx];
                 end
@@ -164,7 +168,7 @@ module data_cache_datapath
             end                          
         end                              
     
-        // new data arrive and need to stored in the cache
+        // new data arrive and need to be store in the cache
         if(data_rvalid_i) begin
             if(DATA_RAM_WIDTH == 32)
                 cache_arr_d[line_ix_miss_d][offset_miss_d] = mem_data_i;
@@ -176,18 +180,21 @@ module data_cache_datapath
             write_cache_miss            = we_d;       
         end         
          
-        if(data_rvalid_i && miss_ix_dirty) begin
+        if(data_rvalid_i && miss_ix_dirty) begin  // write dirty line before we replace it
             write_to_mem                  = 1'b1;
-            rplc_dirty_ind                = line_ix_miss_d;                
+            rplc_dirty_idx                = line_ix_miss_d;                
             cache_dirty_d[line_ix_miss_d] = 'b0;
-        end else if (~miss_o && ((write_to_mem_i || next_is_dirty) && write_ready_i)) begin  // if RAM is not busy -> there is no read RAM (miss) and also not write RAM (data_rvalid_i + dirty)
-            if(cache_dirty[rplc_dirty_ind] != 0 && ~((write_cache_hit && rplc_dirty_ind == line_ix_hit) || (write_cache_miss && (rplc_dirty_ind == line_ix_miss_d)))) begin
+            // if RAM is not busy -> there is no read RAM (miss) and also not write RAM
+            // and we have dirty lines to write
+        end else if (hit && ((write_to_mem_i || next_is_dirty) && write_ready_i)) begin  
+            if(cache_dirty[rplc_dirty_idx] != 0 && ~((write_cache_hit && rplc_dirty_idx == line_ix_hit) || (write_cache_miss && (rplc_dirty_idx == line_ix_miss_d)))) begin
                 write_to_mem                  = 1'b1;
-                cache_dirty_d[rplc_dirty_ind] = 'b0;
+                cache_dirty_d[rplc_dirty_idx] = 'b0;
             end   
         end
-        
+        // -------------------------
         // write to cache or memory
+        // -------------------------
         if(write_cache_miss) begin
             be_32_miss = {{8{be_d[3]}}, {8{be_d[2]}}, {8{be_d[1]}}, {8{be_d[0]}}}; 
             cache_arr_d[line_ix_miss_d][offset_miss_d]   = cache_arr_d[line_ix_miss_d][offset_miss_d] & ~be_32_miss;   
@@ -201,10 +208,10 @@ module data_cache_datapath
             cache_dirty_d[line_ix_hit][offset] = cache_dirty_d[line_ix_hit][offset] | be_i;    
         end
         if(write_to_mem) begin 
-            write_data_o = cache_arr[rplc_dirty_ind];
+            write_data_o = cache_arr[rplc_dirty_idx];
             we_o         = 1'b1;
-            be_o         = cache_dirty[rplc_dirty_ind];
-            waddr_o      = {cache_tag[rplc_dirty_ind], {(LOG2_WORDS_IN_BLOCK + 2){1'b0}}};
+            be_o         = cache_dirty[rplc_dirty_idx];
+            waddr_o      = {cache_tag[rplc_dirty_idx], {(LOG2_WORDS_IN_BLOCK + 2){1'b0}}};
         end
     end //always
 

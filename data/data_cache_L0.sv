@@ -12,17 +12,17 @@
 module data_cache_L0 
 #( 
     parameter RAM_SIZE        = 32768,                // in bytes
-    parameter ADDR_WIDTH      = $clog2(RAM_SIZE) + 1, // one bit more than necessary, for the boot rom
+    parameter ADDR_WIDTH      = $clog2(RAM_SIZE) + 1, // one bit more than necessary, for boot rom
     parameter DATA_RAM_WIDTH  = 128,
     parameter DATA_CORE_WIDTH = 32,
     parameter LOG2_NUM_BLKS   = 3,                    // how many bits (log2) required to represent the rows
-    parameter MAX_DIRTY       = 2                     // (2**LOG2_NUM_BLKS)/2  // the max number of dirty block allowed befor starting to write them to memory
+    parameter MAX_DIRTY       = 2                     // (2**LOG2_NUM_BLKS)/2  // the max number of dirty block allowed befor starting write them to memory
 )
 (
     input  logic                          clk           , 
     input  logic                          rst_n         ,
 
-    // RAM mux interconnection                        
+    // RAM mux interconnection - towards core                        
     input  logic                          en_i          ,
     input  logic [ADDR_WIDTH-1:0]         addr_i        ,
     input  logic [DATA_CORE_WIDTH-1:0]    wdata_i       ,
@@ -80,9 +80,10 @@ module data_cache_L0
     logic                          ram_we;   
     logic [(DATA_RAM_WIDTH/8)-1:0] ram_be;
     logic [(DATA_RAM_WIDTH/8)-1:0] ram_be_d;
+    
     logic                          rvalid;
     logic                          rvalid_d;
-    logic [LOG2_NUM_BLKS-1:0]      dirty_num;
+    logic [LOG2_NUM_BLKS-1:0]      dirty_num;   // number of dirty blocks in the cache
     logic                          ready_to_write;
                                   
     enum logic [2:0] { IDLE, READ_FROM_RAM, WRITE_B4_READ, WRITE_B4_READ_WAIT_GNT, 
@@ -166,23 +167,23 @@ module data_cache_L0
         if( !bypass_en_i ) begin    
             case(CS)
                 IDLE: begin
-                    if(dirty_num > MAX_DIRTY && (CS == IDLE || CS == READ_FROM_RAM))
+                    if((dirty_num > MAX_DIRTY) && ready_to_write)
                         write_to_mem = 1'b1;
                     if(en_i) begin                    
-                        DP_addr  = addr_i;
-                        DP_wdata = wdata_i;
-                        DP_we    = we_i;
-                        DP_be    = be_i;
+                        DP_addr      = addr_i;
+                        DP_wdata     = wdata_i;
+                        DP_we        = we_i;
+                        DP_be        = be_i;
                         start_search = 1'b1;
-                        gnt_o    = 1'b1;
+                        gnt_o        = 1'b1;
                         if(DP_miss) begin
-                            ALGO_en     = 1'b1; 
+                            ALGO_en     = 1'b1;   // get line index for the new data to come
                             ram_en_o    = 1'b1;
                             ram_raddr_d = addr_i;
                         end else
                             rvalid      = 1'b1;                   
                     end 
-                    if(ram_we) begin
+                    if(ram_we) begin              // if we write to memory
                         ram_waddr_d = ram_waddr;
                         ram_wdata_o = ram_wdata;
                         ram_we_o    = 1'b1; 
@@ -191,7 +192,7 @@ module data_cache_L0
                     end
                 end
                 
-                WRITE_B4_READ:          ram_en_o = 1'b1;            
+                WRITE_B4_READ:          ram_en_o = 1'b1;   // we have done the write, now execute read         
                 READ_FROM_RAM_WAIT_GNT: ram_en_o = 1'b1;
                 WRITE_B4_READ_WAIT_GNT: begin
                     ram_en_o = 1'b1;
@@ -243,10 +244,8 @@ module data_cache_L0
         else begin
             case(CS)
                 IDLE: begin
-                    // in case of hit stay in IDLE
-                    // in case of miss, next stage depend if the line to replace is dirty or not
-                    if(ram_en_o) 
-                        if(ram_we) begin // we need to write to memory before read from it 
+                    if(ram_en_o) // in case of miss or write dirty
+                        if(ram_we) begin 
                             if(ram_data_gnt_i) begin
                                 if(DP_miss) NS = WRITE_B4_READ;
                                 else        NS = IDLE;
